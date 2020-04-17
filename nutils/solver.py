@@ -50,7 +50,7 @@ In addition to ``solve_linear`` the solver module defines ``newton`` and
 time dependent problems.
 """
 
-from . import function, cache, numeric, sample, types, util, matrix, warnings
+from . import function, cache, numeric, sample, types, util, matrix, warnings, sparse
 import abc, numpy, itertools, functools, numbers, collections, math, treelog as log
 
 
@@ -62,7 +62,7 @@ class SolverError(Exception): pass
 
 @types.apply_annotations
 @cache.function
-def solve_linear(target:types.strictstr, residual:sample.strictintegral, constrain:types.frozenarray=None, *, arguments:argdict={}, solveargs:types.frozendict={}, **linargs):
+def solve_linear(target, residual, constrain=None, *, arguments:argdict={}, solveargs:types.frozendict={}, **linargs):
   '''solve linear problem
 
   Parameters
@@ -84,13 +84,42 @@ def solve_linear(target:types.strictstr, residual:sample.strictintegral, constra
       Array of ``target`` values for which ``residual == 0``'''
 
   solveargs = _striplin(linargs, solveargs)
-  jacobian = residual.derivative(target)
-  if jacobian.contains(target):
+  targets = (target,) if isinstance(target, str) else target
+  residuals = [residual] if isinstance(residual, sample.Integral) else list(residual)
+  constrains = (constrain,) if isinstance(constrain, numpy.ndarray) else constrain
+
+  argshapes = {}
+  for residual in residuals:
+    argshapes.update(residual.argshapes)
+
+  jacobians = [residual.derivative(target, shape=argshapes[target]) for residual in residuals for target in targets]
+
+  #if jac.shape[0] != jac.shape[1]:
+  #  raise SolverError('matrix is not square')
+
+  jactargets = {target for jac in jacobians for target in jac.argshapes}
+  if jactargets.intersection(targets):
     raise SolverError('problem is not linear')
-  assert target not in arguments, '`target` should not be defined in `arguments`'
-  argshape = residual.argshapes[target]
-  res, jac = sample.eval_integrals(residual, jacobian, **{target: numpy.zeros(argshape)}, **arguments)
-  return jac.solve(-res, constrain=constrain, **solveargs)
+
+  restargets = {target for res in residuals for target in res.argshapes}
+  if not (restargets - set(targets)).issubset(arguments):
+    raise SolverError('missing arguments')
+
+  myargs = {name: arguments[name] if name in arguments else numpy.zeros(argshapes[name]) for name in restargets}
+
+  nres = len(residuals)
+  retvals = sample.eval_integrals_sparse(*(residuals + jacobians), **myargs)
+  res = sparse.toarray(sparse.block([sparse.reshape(data, [-1]) for data in retvals[:nres]]))
+  jac = sparse.tomatrix(sparse.block([[sparse.reshape(data, [ndofs[target],-1]) for data in retvals[nres+i::nres]] for i, target in enumerate(targets)]))
+
+  lhs = jac.solve(-res, constrain=numpy.concatenate(constrain), **solveargs)
+
+  if isinstance(target, str):
+    return lhs
+
+  shapes = numpy.cumsum([0] + [numpy.prod(argshapes[target], dtype=int) for target in targets])
+  return {name: lhs[shapes[i]:shapes[i+1]].reshape(argshapes[name]) for i, name in enumerate(targets)}
+
 
 def solve(gen_lhs_resnorm, tol=0., maxiter=float('inf')):
   warnings.deprecation('solve(x, ...) is deprecated, use x.solve(...) instead')
@@ -730,7 +759,11 @@ def optimize(target:types.strictstr, functional:sample.strictintegral, *, tol:ty
   residual = functional.derivative(target)
   jacobian = residual.derivative(target)
   lhs, cons = _parse_lhs_cons(lhs0, constrain, residual.shape)
-  val, res, jac = sample.eval_integrals(functional, residual, jacobian, **{target: lhs}, **arguments)
+  cons = cons.ravel()
+  val, res, jac = sample.eval_integrals_sparse(functional, residual, jacobian, **{target: lhs}, **arguments)
+  val = sparse.toarray(val)
+  res = sparse.toarray(sparse.reshape(res, [-1]))
+  jac = sparse.tomatrix(sparse.reshape(jac, [residual.size, -1]))
   if droptol is not None:
     nan = ~(cons|jac.rowsupp(droptol))
     cons = cons | nan
@@ -762,10 +795,10 @@ def optimize(target:types.strictstr, functional:sample.strictintegral, *, tol:ty
   elif resnorm > tol:
     solveargs.setdefault('atol', tol)
     dlhs = -jac.solve(res, constrain=cons, **solveargs)
-    lhs = lhs + dlhs
+    lhs = lhs + dlhs.reshape(lhs.shape)
     val += (res + jac@dlhs/2).dot(dlhs)
   if droptol is not None:
-    lhs = numpy.choose(nan, [lhs, numpy.nan])
+    lhs = numpy.choose(nan.reshape(lhs.shape), [lhs, numpy.nan])
     log.info('constrained {}/{} dofs'.format(len(lhs)-nan.sum(), len(lhs)))
   log.info('optimum value {:.2e}'.format(val))
   return lhs

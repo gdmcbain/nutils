@@ -254,6 +254,42 @@ def block(datas):
   assert i == len(retval)
   return retval
 
+def reshape(data, newshape):
+  oldshape = shape(data)
+  newshape = tuple(newshape)
+  oldsize = numpy.prod(oldshape)
+  newsize = numpy.prod(newshape)
+  if -1 in newshape:
+    n = newshape.index(-1)
+    if -1 in newshape[n+1:]:
+      raise Exception('can only specify one unknown dimension')
+    if oldsize % newsize:
+      raise Exception('cannot reshape array if shape {} into shape {}'.format(oldshape, newshape))
+    newshape = newshape[:n] + (-oldsize//newsize,) + newshape[n+1:]
+  elif oldsize != newsize:
+    raise Exception('cannot reshape array if shape {} into shape {}'.format(oldshape, newshape))
+  retval = numpy.empty(data.shape, dtype=dtype(newshape, data.dtype['value']))
+  retval['value'] = data['value']
+  isect, commold, commnew = numpy.intersect1d(numpy.cumprod(oldshape), numpy.cumprod(newshape), return_indices=True)
+  n0 = m0 = 0
+  for n1, m1 in zip(commold+1, commnew+1):
+    if n1 == n0 + 1 and m1 == m1 + 1: # copy
+      retval['index']['i'+str(m0)] = data['index']['i'+str(n0)]
+    elif m1 == m0 + 1: # ravel
+      indices = retval['index']['i'+str(m0)]
+      indices[:] = data['index']['i'+str(n0)]
+      for ni in range(n0+1, n1):
+        indices *= oldshape[ni]
+        indices += data['index']['i'+str(ni)]
+    elif n1 == n0 + 1: # unravel
+      indices = data['index']['i'+str(n0)]
+      for mi in reversed(range(m0+1, m1)):
+        indices, _ = numpy.divmod(indices, newshape[mi], None if mi > m0+1 else retval['index']['i'+str(m0)], retval['index']['i'+str(mi)])
+    else:
+      raise Exception('invalid reshape operation')
+    n0, m0 = n1, m1
+  return retval
+
 def toarray(data):
   '''Convert sparse object to a dense array.
 

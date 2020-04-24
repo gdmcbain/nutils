@@ -51,7 +51,7 @@ time dependent problems.
 """
 
 from . import function, cache, numeric, sample, types, util, matrix, warnings, sparse
-import abc, numpy, itertools, functools, numbers, collections, math, treelog as log
+import abc, numpy, itertools, functools, numbers, collections.abc, math, treelog as log
 
 
 argdict = types.frozendict[types.strictstr,types.frozenarray]
@@ -62,7 +62,7 @@ class SolverError(Exception): pass
 
 @types.apply_annotations
 @cache.function
-def solve_linear(target, residual, constrain=None, *, arguments:argdict={}, solveargs:types.frozendict={}, **linargs):
+def solve_linear(target, residual, *, constrain=None, lhs0:types.frozenarray[types.strictfloat]=None, arguments:argdict={}, solveargs:types.frozendict={}, **linargs):
   '''solve linear problem
 
   Parameters
@@ -84,41 +84,25 @@ def solve_linear(target, residual, constrain=None, *, arguments:argdict={}, solv
       Array of ``target`` values for which ``residual == 0``'''
 
   solveargs = _striplin(linargs, solveargs)
+
+  single = isinstance(target, str)
   targets = (target,) if isinstance(target, str) else target
   residuals = [residual] if isinstance(residual, sample.Integral) else list(residual)
-  constrains = (constrain,) if isinstance(constrain, numpy.ndarray) else constrain
+  lhs, cons, args = _parse_lhs_cons(lhs0, constrain, targets, arguments, util.merge(residual.argshapes for residual in residuals))
 
-  argshapes = {}
-  for residual in residuals:
-    argshapes.update(residual.argshapes)
+  jacobians = [residual.derivative(target) if residual.contains(target)
+          else sample.Integral({}, residual.shape + args[target].shape) for residual in residuals for target in targets]
 
-  jacobians = [residual.derivative(target, shape=argshapes[target]) for residual in residuals for target in targets]
-
-  #if jac.shape[0] != jac.shape[1]:
-  #  raise SolverError('matrix is not square')
-
-  jactargets = {target for jac in jacobians for target in jac.argshapes}
-  if jactargets.intersection(targets):
+  if any(jac.contains(target) for target in targets for jac in jacobians):
     raise SolverError('problem is not linear')
 
-  restargets = {target for res in residuals for target in res.argshapes}
-  if not (restargets - set(targets)).issubset(arguments):
-    raise SolverError('missing arguments')
+  data = iter(sample.eval_integrals_sparse(*(residuals + jacobians), **args))
+  res = sparse.toarray(sparse.block([sparse.reshape(next(data), [-1]) for r in residuals]))
+  jac = matrix.fromsparse(sparse.block([[sparse.reshape(next(data), [-1, args[t].size]) for t in targets] for r in residuals]))
+  assert not list(data)
 
-  myargs = {name: arguments[name] if name in arguments else numpy.zeros(argshapes[name]) for name in restargets}
-
-  nres = len(residuals)
-  retvals = sample.eval_integrals_sparse(*(residuals + jacobians), **myargs)
-  res = sparse.toarray(sparse.block([sparse.reshape(data, [-1]) for data in retvals[:nres]]))
-  jac = sparse.tomatrix(sparse.block([[sparse.reshape(data, [ndofs[target],-1]) for data in retvals[nres+i::nres]] for i, target in enumerate(targets)]))
-
-  lhs = jac.solve(-res, constrain=numpy.concatenate(constrain), **solveargs)
-
-  if isinstance(target, str):
-    return lhs
-
-  shapes = numpy.cumsum([0] + [numpy.prod(argshapes[target], dtype=int) for target in targets])
-  return {name: lhs[shapes[i]:shapes[i+1]].reshape(argshapes[name]) for i, name in enumerate(targets)}
+  lhs -= jac.solve(res, constrain=cons, **solveargs)
+  return args[targets[0]] if single else args
 
 
 def solve(gen_lhs_resnorm, tol=0., maxiter=float('inf')):
@@ -182,6 +166,8 @@ class RecursionWithSolve(cache.Recursion):
       log.info('converged in {} steps to residual {:.1e}'.format(i, info.resnorm))
     return lhs, info
 
+def _frozen(arg):
+  return types.frozenarray(arg) if isinstance(arg, numpy.ndarray) else types.frozendict({k: _frozen(v) for k, v in arg.items()}) if isinstance(arg, dict) else arg
 
 class newton(RecursionWithSolve, length=1):
   '''iteratively solve nonlinear problem by gradient descent
@@ -228,56 +214,59 @@ class newton(RecursionWithSolve, length=1):
   '''
 
   @types.apply_annotations
-  def __init__(self, target:types.strictstr, residual:sample.strictintegral, jacobian:sample.strictintegral=None, lhs0:types.frozenarray[types.strictfloat]=None, relax0:float=1., constrain:types.frozenarray=None, linesearch=None, failrelax:types.strictfloat=1e-6, arguments:argdict={}, solveargs:types.frozendict={}, **linargs):
+  def __init__(self, target, residual:_frozen, jacobian=None, lhs0:_frozen=None, relax0:float=1., constrain:_frozen=None, linesearch=None, failrelax:types.strictfloat=1e-6, arguments:argdict={}, solveargs:types.frozendict={}, **linargs):
     super().__init__()
-    if target in arguments:
-      raise ValueError('`target` should not be defined in `arguments`')
-    self.target = target
-    self.residual = residual
-    self.jacobian = _derivative(residual, target, jacobian)
-    self.lhs0, constrain = _parse_lhs_cons(lhs0, constrain, residual.shape)
+    single = isinstance(target, str)
+    self.targets = [target] if single else list(target)
+    self.residuals = [residual] if isinstance(residual, sample.Integral) else list(residual)
+    self.lhs, cons, self.args = _parse_lhs_cons(lhs0, constrain, self.targets, arguments, util.merge(residual.argshapes for residual in self.residuals))
+    self.retval = self.args[self.targets[0]] if single else self.args
+    self.free = ~cons
+    self.jacobians = [residual.derivative(target) if residual.contains(target)
+                 else sample.Integral({}, residual.shape + self.args[target].shape) for residual in self.residuals for target in self.targets]
     self.relax0 = relax0
-    self.free = ~constrain
     self.linesearch = linesearch or NormBased.legacy(linargs)
     self.failrelax = failrelax
-    self.arguments = arguments
     self.solveargs = _striplin(linargs, solveargs)
     self.solveargs.setdefault('rtol', 1e-3)
 
-  def _eval(self, lhs):
-    res, jac = sample.eval_integrals(self.residual, self.jacobian, **{self.target: lhs}, **self.arguments)
+  def _eval(self):
+    data = iter(sample.eval_integrals_sparse(*(self.residuals + self.jacobians), **self.args))
+    res = sparse.toarray(sparse.block([sparse.reshape(next(data), [-1]) for r in self.residuals]))
+    jac = matrix.fromsparse(sparse.block([[sparse.reshape(next(data), [-1, self.args[t].size]) for t in self.targets] for r in self.residuals]))
+    assert not list(data)
     return res[self.free], jac.submatrix(self.free, self.free)
 
   def resume(self, history):
     if history:
+      raise NotImplementedError
       lhs, info = history[-1]
       res, jac = self._eval(lhs)
       assert numpy.linalg.norm(res) == info.resnorm
       relax = info.relax
     else:
-      lhs = self.lhs0
-      res, jac = self._eval(lhs)
+      res, jac = self._eval()
       relax = self.relax0
-      yield lhs, types.attributes(resnorm=numpy.linalg.norm(res), relax=relax)
+      yield self.retval, types.attributes(resnorm=numpy.linalg.norm(res), relax=relax)
     while True:
-      dlhs = -jac.solve_leniently(res, **self.solveargs) # compute new search vector
+      dlhs = jac.solve_leniently(-res, **self.solveargs) # compute new search vector
+      res0 = res
       dres = jac@dlhs # == -res if dlhs was solved to infinite precision
-      while True: # line search
-        newlhs = lhs.copy()
-        newlhs[self.free] += relax * dlhs
-        newres, newjac = self._eval(newlhs)
-        scale, accept = self.linesearch(res, relax*dres, newres, relax*newjac@dlhs)
-        if accept:
-          break
+      self.lhs[self.free] += relax * dlhs
+      res, jac = self._eval()
+      scale, accept = self.linesearch(res0, relax*dres, res, relax*jac@dlhs)
+      while not accept: # line search
+        assert scale < 1
+        oldrelax = relax
         relax *= scale
         if relax <= self.failrelax:
           raise SolverError('stuck in local minimum')
+        self.lhs[self.free] += (relax - oldrelax) * dlhs
+        res, jac = self._eval()
+        scale, accept = self.linesearch(res0, relax*dres, res, relax*jac@dlhs)
       log.info('update accepted at relaxation', round(relax, 5))
-      lhs = newlhs
-      res = newres
-      jac = newjac
       relax = min(relax * scale, 1)
-      yield lhs, types.attributes(resnorm=numpy.linalg.norm(res), relax=relax)
+      yield self.retval, types.attributes(resnorm=numpy.linalg.norm(res), relax=relax)
 
 
 class LineSearch(types.Immutable):
@@ -756,19 +745,27 @@ def optimize(target:types.strictstr, functional:sample.strictintegral, *, tol:ty
   if linesearch is None:
     linesearch = NormBased.legacy(linargs)
   solveargs = _striplin(linargs, solveargs)
-  residual = functional.derivative(target)
-  jacobian = residual.derivative(target)
-  lhs, cons = _parse_lhs_cons(lhs0, constrain, residual.shape)
-  cons = cons.ravel()
-  val, res, jac = sample.eval_integrals_sparse(functional, residual, jacobian, **{target: lhs}, **arguments)
-  val = sparse.toarray(val)
-  res = sparse.toarray(sparse.reshape(res, [-1]))
-  jac = sparse.tomatrix(sparse.reshape(jac, [residual.size, -1]))
+
+  single = isinstance(target, str)
+  targets = (target,) if single else target
+  lhs, cons, args = _parse_lhs_cons(lhs0, constrain, targets, arguments, functional.argshapes)
+
+  residuals = [functional.derivative(target) for target in targets]
+  jacobians = [residual.derivative(target) for residual in residuals for target in targets]
+
+  data = iter(sample.eval_integrals_sparse(*([functional] + residuals + jacobians), **args))
+  val = sparse.toarray(next(data))
+  res = sparse.toarray(sparse.block([sparse.reshape(next(data), [-1]) for t in targets]))
+  jac = matrix.fromsparse(sparse.block([[sparse.reshape(next(data), [args[ti].size, args[tj].size]) for tj in targets] for ti in targets]))
+  assert not list(data)
+
   if droptol is not None:
     nan = ~(cons|jac.rowsupp(droptol))
-    cons = cons | nan
+    cons |= nan
+
   resnorm = numpy.linalg.norm(res[~cons])
-  if jacobian.contains(target):
+  if any(jacobian.contains(target) for jacobian in jacobians for target in targets):
+    raise NotImplementedError
     if tol <= 0:
       raise ValueError('nonlinear optimization problem requires a nonzero "tol" argument')
     solveargs.setdefault('rtol', 1e-3)
@@ -785,7 +782,7 @@ def optimize(target:types.strictstr, functional:sample.strictintegral, *, tol:ty
           dres0 = (jac@dlhs)[~cons] # == -res0 if dlhs was solved to infinite precision
           resnorm0 = resnorm
         lhs = lhs0 + relax * dlhs
-        val, res, jac = sample.eval_integrals(functional, residual, jacobian, **{target: lhs}, **arguments)
+        val, res, jac = sample.eval_integrals(functional, residual, jacobian, **{target: lhs}, **args)
         resnorm = numpy.linalg.norm(res[~cons])
         scale, accept = linesearch(res0, relax*dres0, res[~cons], relax*(jac@dlhs)[~cons])
         relax = min(relax * scale, 1)
@@ -794,14 +791,14 @@ def optimize(target:types.strictstr, functional:sample.strictintegral, *, tol:ty
       log.info('converged with residual {:.1e}'.format(resnorm))
   elif resnorm > tol:
     solveargs.setdefault('atol', tol)
-    dlhs = -jac.solve(res, constrain=cons, **solveargs)
-    lhs = lhs + dlhs.reshape(lhs.shape)
+    dlhs = jac.solve(-res, constrain=cons, **solveargs)
+    lhs += dlhs
     val += (res + jac@dlhs/2).dot(dlhs)
   if droptol is not None:
-    lhs = numpy.choose(nan.reshape(lhs.shape), [lhs, numpy.nan])
+    lhs[nan] = numpy.nan
     log.info('constrained {}/{} dofs'.format(len(lhs)-nan.sum(), len(lhs)))
   log.info('optimum value {:.2e}'.format(val))
-  return lhs
+  return args[targets[0]] if single else args
 
 
 ## HELPER FUNCTIONS
@@ -820,26 +817,36 @@ def _striplin(linargs, solveargs):
     solveargs[key[3:]] = value
   return solveargs
 
-def _parse_lhs_cons(lhs0, constrain, shape):
-  if lhs0 is None:
-    lhs0 = types.frozenarray.full(shape, fill_value=0.)
-  elif lhs0.shape == shape:
-    lhs0 = types.frozenarray(lhs0)
-  else:
-    raise ValueError('expected `lhs0` with shape {} but got {}'.format(shape, lhs0.shape))
-  if constrain is None:
-    constrain = types.frozenarray.full(shape, fill_value=False)
-  elif constrain.shape != shape:
-    raise ValueError('expected `constrain` with shape {} but got {}'.format(shape, constrain.shape))
-  elif constrain.dtype == float:
-    isnan = numpy.isnan(constrain)
-    lhs0 = types.frozenarray(numpy.choose(isnan, [constrain, lhs0]), copy=False)
-    constrain = types.frozenarray(~isnan, copy=False)
-  elif constrain.dtype == bool:
-    constrain = types.frozenarray(constrain)
-  else:
-    raise ValueError('`constrain` should have dtype bool or float but got {}'.format(constrain.dtype))
-  return lhs0, constrain
+def _parse_lhs_cons(lhs0, constrain, targets, arguments, shapes):
+  for target in targets:
+    if target not in shapes:
+      raise SolverError('target does not occur in functional: {!r}'.format(target))
+  for name in arguments:
+    if name in shapes and shapes[name] != arguments[name].shape:
+      raise SolverError('incorrect shape for {!r}: expected {}, got {}'.format(name, shapes[name], arguments[name.shape]))
+  for name in shapes:
+    if name not in arguments and name not in targets:
+      raise SolverError('missing argument: {!r}'.format(name))
+  offsets = numpy.cumsum([0] + [numpy.prod(shapes[target], dtype=int) for target in targets])
+  ndofs = offsets[-1]
+  lhs = numpy.zeros(ndofs)
+  cons = numpy.zeros(ndofs, dtype=bool)
+  arguments = arguments.copy()
+  offset = 0
+  for i, target in enumerate(targets):
+    s = slice(offsets[i], offsets[i+1])
+    shape = shapes[target]
+    arguments[target] = mylhs = lhs[s].reshape(shape)
+    v = lhs0.get(target) if isinstance(lhs0, collections.abc.Mapping) else lhs0
+    if v is not None:
+      mylhs[...] = v
+    c = constrain.get(target) if isinstance(constrain, collections.abc.Mapping) else constrain
+    if c is not None:
+      if c.dtype != bool:
+        v, c = c, ~numpy.isnan(c)
+        mylhs[c] = v[c]
+      cons[s].reshape(shape)[:] = c
+  return lhs, cons, arguments
 
 def _derivative(residual, target, jacobian=None):
   if jacobian is None:

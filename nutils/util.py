@@ -48,6 +48,15 @@ def gather(items):
     values.append(value)
   return gathered
 
+def merge(dicts):
+  merged = {}
+  for d in dicts:
+    for k in d:
+      if k in merged and merged[k] != d[k]:
+        raise ValueError('items to not match: {} != {}'.format(merged[k], d[k]))
+    merged.update(d)
+  return merged
+
 def pairwise(items, *, periodic=False):
   items = iter(items)
   try:

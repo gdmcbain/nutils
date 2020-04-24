@@ -63,8 +63,8 @@ def issparse(data):
 
 def issparsedtype(dtype):
   return dtype.names == ('index', 'value') and all(
-    len(value) == 3 and name == 'i'+str(value[1]) and isinstance(value[2], int) and 0 <= value[2] < 256**value[0].itemsize
-      for name, value in dtype['index'].fields.items())
+    len(value) == 3 and isinstance(value[2], int) and 0 <= value[2] < 256**value[0].itemsize
+      for value in dtype['index'].fields.values())
 
 def ndim(data):
   '''Dimension of the sparse object.'''
@@ -257,8 +257,8 @@ def block(datas):
 def reshape(data, newshape):
   oldshape = shape(data)
   newshape = tuple(newshape)
-  oldsize = numpy.prod(oldshape)
-  newsize = numpy.prod(newshape)
+  oldsize = numpy.prod(oldshape, dtype=int)
+  newsize = numpy.prod(newshape, dtype=int)
   if -1 in newshape:
     n = newshape.index(-1)
     if -1 in newshape[n+1:]:
@@ -268,12 +268,20 @@ def reshape(data, newshape):
     newshape = newshape[:n] + (-oldsize//newsize,) + newshape[n+1:]
   elif oldsize != newsize:
     raise Exception('cannot reshape array if shape {} into shape {}'.format(oldshape, newshape))
+  if oldshape == newshape:
+    return data
   retval = numpy.empty(data.shape, dtype=dtype(newshape, data.dtype['value']))
   retval['value'] = data['value']
   isect, commold, commnew = numpy.intersect1d(numpy.cumprod(oldshape), numpy.cumprod(newshape), return_indices=True)
   n0 = m0 = 0
-  for n1, m1 in zip(commold+1, commnew+1):
-    if n1 == n0 + 1 and m1 == m1 + 1: # copy
+  for n1, m1 in zip(numpy.hstack([commold+1, len(oldshape)]), numpy.hstack([commnew+1, len(newshape)])):
+    if n0 == n1:
+      for mi in range(m0, m1):
+        assert newshape[mi] == 1
+        retval['index']['i'+str(mi)].fill(0)
+    elif m0 == m1:
+      assert oldshape[n0:n1] == (1,) * (n1-n0)
+    elif n1 == n0 + 1 and m1 == m1 + 1: # copy
       retval['index']['i'+str(m0)] = data['index']['i'+str(n0)]
     elif m1 == m0 + 1: # ravel
       indices = retval['index']['i'+str(m0)]

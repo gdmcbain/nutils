@@ -53,7 +53,7 @@ scripts in the examples directory, such as the Laplace problem::
 
     $ python3 examples/laplace.py
 
-Log messages should appear in the terminal during operation. Simultaneously, a
+Log messages should appear in the terminal during operation. Simultaneously, an
 html file ``log.html`` and any produced figures are written to
 ``public_html/laplace.py/yyyy/mm/dd/hh-mm-ss`` in the home directory. In case a
 webserver is running and configured for user directories this automatically
